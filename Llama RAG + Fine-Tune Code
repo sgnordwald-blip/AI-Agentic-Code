@@ -1,0 +1,214 @@
+# ============================================================
+# CELL 1 — Install dependencies
+# ============================================================
+# !pip install unsloth bitsandbytes transformers accelerate datasets trl pytz -q
+
+# ============================================================
+# CELL 2 — Environment flags
+# ============================================================
+import os
+os.environ["UNSLOTH_DISABLE_RL"] = "1"
+
+# ============================================================
+# CELL 3 — Load FastLanguageModel
+# ============================================================
+from unsloth import FastLanguageModel
+
+max_seq_length = 2048
+dtype = None
+load_in_4bit = True
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="unsloth/llama-3-8b-bnb-4bit",
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit
+)
+
+# ============================================================
+# CELL 4 — Add LoRA adapters
+# ============================================================
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth",
+    random_state=42,
+)
+print("✅ LoRA adapters added.")
+
+# ============================================================
+# CELL 5 — Energy data + dataset preparation
+# ============================================================
+from datasets import Dataset
+
+# ---------- Structured energy knowledge base ----------
+ENERGY_DATA = {
+    "location": {"city": "Fort Collins", "state": "Colorado"},
+    "appliances": {
+        "washer": {
+            "brand": "Samsung",
+            "model": "WF45T60**A*",
+            "energy_usage": {"annual_kWh": 90, "per_load_kWh": 0.33},
+            "cost_per_load_usd": {
+                "summer": {"peak": 0.1066, "off_peak": 0.0296},
+                "non_summer": {"peak": 0.0983, "off_peak": 0.0296},
+            },
+            "off_peak_savings": {
+                "savings_per_kWh": {"summer": 0.0797, "non_summer": 0.0687},
+                "percentage_saved": {"summer": 72.2, "non_summer": 69.9},
+            },
+        },
+        "dryer": {
+            "brand": "Samsung",
+            "model": "DV45DG60**H*",
+            "energy_usage": {"annual_kWh": 263, "per_load_kWh": 0.99},
+            "cost_per_load_usd": {
+                "summer": {"peak": 0.3198, "off_peak": 0.0889},
+                "non_summer": {"peak": 0.2948, "off_peak": 0.0889},
+            },
+            "off_peak_savings": {
+                "savings_per_kWh": {"summer": 0.2309, "non_summer": 0.2059},
+                "percentage_saved": {"summer": 72.2, "non_summer": 69.9},
+            },
+        },
+    },
+    "utility_rates": {
+        "base_monthly_charge_usd": 12.67,
+        "tier_charge_over_700_kWh_usd_per_kWh": 0.0316,
+        "time_of_day_rates_usd_per_kWh": {
+            "summer": {
+                "months": ["May", "June", "July", "August", "September"],
+                "on_peak": {"days": "Monday-Friday", "hours": "2 PM - 7 PM", "rate": 0.3230},
+                "off_peak": {"rate": 0.0898},
+            },
+            "non_summer": {
+                "months": ["October", "November", "December", "January", "February", "March", "April"],
+                "on_peak": {"days": "Monday-Friday", "hours": "5 PM - 9 PM", "rate": 0.2978},
+                "off_peak": {"rate": 0.0898},
+            },
+        },
+        "electric_clothes_dryer_special_rate_usd_per_kWh": {"on_peak": 0.81, "off_peak": 0.24},
+    },
+    "monthly_peak_hours_schedule": {
+        "January":   {"start": "5 PM", "end": "9 PM"},
+        "February":  {"start": "5 PM", "end": "9 PM"},
+        "March":     {"start": "5 PM", "end": "9 PM"},
+        "April":     {"start": "5 PM", "end": "9 PM"},
+        "May":       {"start": "2 PM", "end": "7 PM"},
+        "June":      {"start": "2 PM", "end": "7 PM"},
+        "July":      {"start": "2 PM", "end": "7 PM"},
+        "August":    {"start": "2 PM", "end": "7 PM"},
+        "September": {"start": "2 PM", "end": "7 PM"},
+        "October":   {"start": "5 PM", "end": "9 PM"},
+        "November":  {"start": "5 PM", "end": "9 PM"},
+        "December":  {"start": "5 PM", "end": "9 PM"},
+    },
+}
+
+# ---------- Alpaca prompt template ----------
+ALPACA_PROMPT = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+
+EOS_TOKEN = tokenizer.eos_token
+
+RAW_DATA = [
+    # ... Your RAW_DATA entries go here ...
+]
+
+def format_prompts(examples):
+    texts = []
+    for instruction, inp, out in zip(examples["instruction"], examples["input"], examples["output"]):
+        text = ALPACA_PROMPT.format(instruction, inp, out) + EOS_TOKEN
+        texts.append(text)
+    return {"text": texts}
+
+dataset = Dataset.from_list(RAW_DATA)
+dataset = dataset.map(format_prompts, batched=True)
+print(f"✅ Dataset ready — {len(dataset)} examples.")
+
+# ============================================================
+# CELL 6 — Fine-tuning SFT Trainer
+# ============================================================
+import torch
+from trl import SFTTrainer, SFTConfig
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=SFTConfig(
+        dataset_text_field="text",
+        max_seq_length=max_seq_length,
+        dataset_num_proc=2,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=5,
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=10,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=42,
+        output_dir="outputs",
+        packing=False,
+    ),
+)
+trainer.train()
+
+# ============================================================
+# CELL 7 — Save model + build RAG engine
+# ============================================================
+from datetime import datetime
+import pytz
+
+# Save LoRA weights
+model.save_pretrained("lora_model")
+tokenizer.save_pretrained("lora_model")
+print("✅ Model saved to ./lora_model")
+
+# Switch model to inference mode
+FastLanguageModel.for_inference(model)
+
+# --- RAG utilities ---
+SYSTEM_INSTRUCTION = (
+    "You are an energy cost assistant for a home in Fort Collins, Colorado. "
+    "Answer questions about electricity rates, appliance costs, and optimal times "
+    "to run appliances. Be concise, accurate, and cite specific dollar amounts "
+    "or kWh figures from the context when relevant."
+)
+
+# Functions: flatten_json, expand_query, retrieve_context, get_time_context, ask
+# ... Paste all functions from Cell 7 here ...
+
+FLAT_DOCS = flatten_json(ENERGY_DATA)
+print(f"✅ RAG index built — {len(FLAT_DOCS)} document chunks.")
+
+print("✅ ask() function ready. Run CELL 8 to start chatting.")
+
+# ============================================================
+# CELL 8 — Interactive Chat Loop
+# ============================================================
+# ... Paste Cell 8 code here ...
+
+# ============================================================
+# CELL 9 — Quick single-question test (optional)
+# ============================================================
+# ... Paste Cell 9 code here ...
