@@ -1,0 +1,173 @@
+# ============================================================
+# SECTION 1: Install Dependencies
+# ============================================================
+!pip install unsloth
+!pip install bitsandbytes
+!pip install transformers accelerate
+
+
+# ============================================================
+# SECTION 2: Environment Setup
+# ============================================================
+import os
+os.environ["UNSLOTH_DISABLE_RL"] = "1"
+
+
+# ============================================================
+# SECTION 3: Load Model
+# ============================================================
+from unsloth import FastLanguageModel
+
+max_seq_length = 2048
+dtype = None
+load_in_4bit = True
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name="unsloth/llama-3-8b-bnb-4bit",
+    max_seq_length=max_seq_length,
+    dtype=dtype,
+    load_in_4bit=load_in_4bit
+)
+
+
+# ============================================================
+# SECTION 4: Add LoRA Adapters
+# ============================================================
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj"
+    ],
+    lora_alpha=16,
+    lora_dropout=0,
+    bias="none",
+    use_gradient_checkpointing="unsloth",
+    random_state=42,
+)
+
+
+# ============================================================
+# SECTION 5: Prepare Dataset
+# ============================================================
+from datasets import Dataset
+
+alpaca_prompt = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+{}
+
+### Input:
+{}
+
+### Response:
+{}"""
+
+# --- Example Data ---
+raw_data = [
+    {
+        "instruction": "You are a helpful assistant.",
+        "input": "Who developed GPT models?",
+        "output": "GPT models were developed by OpenAI."
+    },
+    {
+        "instruction": "You are a helpful assistant.",
+        "input": "What is the capital of France?",
+        "output": "The capital of France is Paris."
+    },
+]
+
+EOS_TOKEN = tokenizer.eos_token
+
+def format_prompts(examples):
+    instructions = examples["instruction"]
+    inputs = examples["input"]
+    outputs = examples["output"]
+
+    texts = []
+    for instruction, inp, out in zip(instructions, inputs, outputs):
+        text = alpaca_prompt.format(instruction, inp, out) + EOS_TOKEN
+        texts.append(text)
+
+    return {"text": texts}
+
+dataset = Dataset.from_list(raw_data)
+dataset = dataset.map(format_prompts, batched=True)
+
+
+# ============================================================
+# SECTION 6: Training
+# ============================================================
+import torch
+from trl import SFTTrainer, SFTConfig
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=SFTConfig(
+        dataset_text_field="text",
+        max_seq_length=max_seq_length,
+        dataset_num_proc=2,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=5,
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+        logging_steps=10,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="linear",
+        seed=42,
+        output_dir="outputs",
+        packing=False,
+    ),
+)
+
+trainer.train()
+
+
+# ============================================================
+# SECTION 7: Save Model
+# ============================================================
+model.save_pretrained("lora_model")
+tokenizer.save_pretrained("lora_model")
+
+# Optional merged model:
+# model.save_pretrained_merged("merged_model", tokenizer, save_method="merged_16bit")
+
+
+# ============================================================
+# SECTION 8: Inference
+# ============================================================
+from unsloth import FastLanguageModel
+import torch
+
+FastLanguageModel.for_inference(model)
+
+instruction = "You are a helpful assistant."
+input_text = "Who developed GPT models?"
+
+inputs = tokenizer(
+    [alpaca_prompt.format(instruction, input_text, "")],
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+    max_length=512,
+).to("cuda")
+
+with torch.inference_mode():
+    outputs = model.generate(
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs["attention_mask"],
+        max_new_tokens=100,
+        use_cache=False,
+        temperature=1.0,
+        do_sample=False,
+    )
+
+response = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+print(response)
